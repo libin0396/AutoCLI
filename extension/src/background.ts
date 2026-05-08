@@ -254,6 +254,8 @@ function initialize(): void {
   console.log('[autocli] AutoCLI extension initialized');
 }
 
+initialize();
+
 chrome.runtime.onInstalled.addListener(() => {
   initialize();
 });
@@ -263,7 +265,10 @@ chrome.runtime.onStartup.addListener(() => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'keepalive') void connect();
+  if (alarm.name === 'keepalive') {
+    initialize();
+    void connect();
+  }
 });
 
 // ─── Popup status API ───────────────────────────────────────────────

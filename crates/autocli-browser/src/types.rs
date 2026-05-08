@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DaemonCommand {
     pub id: String,
     pub action: String,
@@ -118,5 +119,32 @@ impl DaemonResult {
             data: None,
             error: Some(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DaemonCommand;
+    use serde_json::json;
+
+    #[test]
+    fn daemon_command_serializes_tab_id_as_camel_case() {
+        let value = serde_json::to_value(
+            DaemonCommand::new("exec")
+                .with_workspace("site:test")
+                .with_tab_id(42),
+        )
+        .expect("command should serialize");
+
+        assert_eq!(
+            value,
+            json!({
+                "id": value.get("id").and_then(|v| v.as_str()).expect("id should exist"),
+                "action": "exec",
+                "workspace": "site:test",
+                "tabId": 42
+            })
+        );
+        assert!(value.get("tab_id").is_none(), "tab_id should not be serialized");
     }
 }

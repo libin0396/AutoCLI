@@ -64,7 +64,12 @@ impl DaemonPage {
 impl IPage for DaemonPage {
     async fn goto(&self, url: &str, _options: Option<GotoOptions>) -> Result<(), CliError> {
         let cmd = self.cmd("navigate").await.with_url(url);
-        self.send(cmd).await?;
+        let val = self.send(cmd).await?;
+        let tab_id = val
+            .get("tabId")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| CliError::browser_connect("Navigate returned no tabId"))?;
+        *self.tab_id.write().await = Some(tab_id);
         // The Chrome extension's handleNavigate already waits for the page to
         // fully load (URL change + status=complete, up to 15s). No additional
         // DOM stability check is needed here.
@@ -276,4 +281,126 @@ pub(crate) fn base64_decode_simple(input: &str) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DaemonPage;
+    use crate::daemon_client::DaemonClient;
+    use axum::{extract::State, routing::post, Json, Router};
+    use autocli_core::IPage;
+    use serde_json::{json, Value};
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Clone)]
+    struct TestState {
+        received: Arc<Mutex<Vec<Value>>>,
+        responses: Arc<Mutex<VecDeque<Value>>>,
+    }
+
+    async fn command_handler(
+        State(state): State<TestState>,
+        Json(cmd): Json<Value>,
+    ) -> Json<Value> {
+        state
+            .received
+            .lock()
+            .expect("received lock poisoned")
+            .push(cmd.clone());
+
+        let id = cmd
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("missing-id")
+            .to_string();
+        let data = state
+            .responses
+            .lock()
+            .expect("responses lock poisoned")
+            .pop_front()
+            .unwrap_or(Value::Null);
+
+        Json(json!({
+            "id": id,
+            "ok": true,
+            "data": data
+        }))
+    }
+
+    async fn spawn_test_server(responses: Vec<Value>) -> (u16, Arc<Mutex<Vec<Value>>>) {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let state = TestState {
+            received: Arc::clone(&received),
+            responses: Arc::new(Mutex::new(VecDeque::from(responses))),
+        };
+        let app = Router::new()
+            .route("/command", post(command_handler))
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let port = listener
+            .local_addr()
+            .expect("listener should have local addr")
+            .port();
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        (port, received)
+    }
+
+    #[tokio::test]
+    async fn goto_persists_returned_tab_id_for_follow_up_exec() {
+        let (port, received) = spawn_test_server(vec![
+            json!({ "tabId": 42, "url": "https://example.com", "title": "Example" }),
+            json!("https://example.com"),
+        ])
+        .await;
+
+        let page = DaemonPage::new(Arc::new(DaemonClient::new(port)), "site:test");
+        page.goto("https://example.com", None)
+            .await
+            .expect("goto should succeed");
+
+        let url = page.url().await.expect("url should succeed");
+        assert_eq!(url, "https://example.com");
+
+        let commands = received.lock().expect("received lock poisoned");
+        assert_eq!(commands.len(), 2, "navigate + exec should be sent");
+        assert_eq!(commands[0].get("action").and_then(|v| v.as_str()), Some("navigate"));
+        assert_eq!(commands[1].get("action").and_then(|v| v.as_str()), Some("exec"));
+        assert_eq!(commands[1].get("tabId").and_then(|v| v.as_u64()), Some(42));
+        assert!(
+            commands[1].get("tab_id").is_none(),
+            "follow-up exec should use tabId, not tab_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn goto_fails_when_navigate_response_has_no_tab_id() {
+        let (port, _received) = spawn_test_server(vec![json!({
+            "url": "https://example.com",
+            "title": "Example"
+        })])
+        .await;
+
+        let page = DaemonPage::new(Arc::new(DaemonClient::new(port)), "site:test");
+        let err = page
+            .goto("https://example.com", None)
+            .await
+            .expect_err("goto should fail without tabId");
+
+        assert!(
+            err.to_string().contains("Navigate returned no tabId"),
+            "unexpected error: {err}"
+        );
+    }
 }
