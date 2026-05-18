@@ -60,6 +60,11 @@ impl DaemonPage {
     }
 }
 
+fn is_unsupported_network_capture_error(err: &CliError) -> bool {
+    let message = err.to_string().to_lowercase();
+    message.contains("unknown action") && message.contains("network-capture")
+}
+
 #[async_trait]
 impl IPage for DaemonPage {
     async fn goto(&self, url: &str, _options: Option<GotoOptions>) -> Result<(), CliError> {
@@ -257,7 +262,11 @@ impl IPage for DaemonPage {
         if let Some(limit) = body_limit {
             cmd = cmd.with_body_limit(limit);
         }
-        let val = self.send(cmd).await?;
+        let val = match self.send(cmd).await {
+            Ok(val) => val,
+            Err(err) if is_unsupported_network_capture_error(&err) => return Ok(()),
+            Err(err) => return Err(err),
+        };
         if let Some(tab_id) = val.get("tabId").and_then(|v| v.as_u64()) {
             *self.tab_id.write().await = Some(tab_id);
         }
@@ -273,7 +282,11 @@ impl IPage for DaemonPage {
             .await
             .with_op("collect")
             .with_clear(clear);
-        let val = self.send(cmd).await?;
+        let val = match self.send(cmd).await {
+            Ok(val) => val,
+            Err(err) if is_unsupported_network_capture_error(&err) => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
         let reqs: Vec<NetworkRequest> = serde_json::from_value(val).unwrap_or_default();
         Ok(reqs)
     }
@@ -356,6 +369,14 @@ mod tests {
             .expect("responses lock poisoned")
             .pop_front()
             .unwrap_or(Value::Null);
+
+        if let Some(error) = data.get("__error").and_then(|v| v.as_str()) {
+            return Json(json!({
+                "id": id,
+                "ok": false,
+                "error": error
+            }));
+        }
 
         Json(json!({
             "id": id,
@@ -475,5 +496,25 @@ mod tests {
         assert_eq!(commands[1].get("op").and_then(|v| v.as_str()), Some("collect"));
         assert_eq!(commands[1].get("tabId").and_then(|v| v.as_u64()), Some(77));
         assert_eq!(commands[1].get("clear").and_then(|v| v.as_bool()), Some(false));
+    }
+
+    #[tokio::test]
+    async fn network_capture_unsupported_action_falls_back_to_empty_responses() {
+        let (port, _received) = spawn_test_server(vec![
+            json!({ "__error": "Unknown action: network-capture" }),
+            json!({ "__error": "Unknown action: network-capture" }),
+        ])
+        .await;
+
+        let page = DaemonPage::new(Arc::new(DaemonClient::new(port)), "site:goofish");
+        page.start_network_capture("mtop.taobao.idlemtopsearch.pc.search", Some(4096))
+            .await
+            .expect("old extensions should not make passive capture fatal");
+        let responses = page
+            .get_network_responses(true)
+            .await
+            .expect("old extensions should collect as empty");
+
+        assert!(responses.is_empty());
     }
 }
