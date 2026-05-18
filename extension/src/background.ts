@@ -622,9 +622,13 @@ async function handleNavigate(cmd: Command, workspace: string): Promise<Result> 
   const beforeTab = resolved.tab ?? await chrome.tabs.get(tabId);
   const beforeNormalized = normalizeUrlForComparison(beforeTab.url);
   const targetUrl = cmd.url;
+  const captureActive = hasActiveNetworkCapture(tabId);
+  const alreadyAtTarget = beforeTab.status === 'complete' && isTargetUrl(beforeTab.url, targetUrl);
 
-  // Fast-path: tab is already at the target URL and fully loaded.
-  if (beforeTab.status === 'complete' && isTargetUrl(beforeTab.url, targetUrl)) {
+  // Fast-path: tab is already at the target URL and fully loaded. When passive
+  // network capture is active, reload the target instead so the browser emits
+  // fresh Network.responseReceived events for this run.
+  if (alreadyAtTarget && !captureActive) {
     return {
       id: cmd.id,
       ok: true,
@@ -635,14 +639,18 @@ async function handleNavigate(cmd: Command, workspace: string): Promise<Result> 
   // Detach any existing debugger before top-level navigation unless a passive
   // network capture is active. Captures must stay attached across navigation so
   // CDP Network.responseReceived can observe the browser's own requests.
-  if (!hasActiveNetworkCapture(tabId)) {
+  if (!captureActive) {
     await executor.detach(tabId);
   } else {
     await executor.ensureAttached(tabId);
     await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {});
   }
 
-  await chrome.tabs.update(tabId, { url: targetUrl });
+  if (alreadyAtTarget && captureActive) {
+    await chrome.tabs.reload(tabId, { bypassCache: true });
+  } else {
+    await chrome.tabs.update(tabId, { url: targetUrl });
+  }
 
   // Wait until navigation completes. Resolve when status is 'complete' AND either:
   // - the URL matches the target (handles same-URL / canonicalized navigations), OR
@@ -663,6 +671,9 @@ async function handleNavigate(cmd: Command, workspace: string): Promise<Result> 
     };
 
     const isNavigationDone = (url: string | undefined): boolean => {
+      if (alreadyAtTarget && captureActive) {
+        return isTargetUrl(url, targetUrl);
+      }
       return isTargetUrl(url, targetUrl) || normalizeUrlForComparison(url) !== beforeNormalized;
     };
 

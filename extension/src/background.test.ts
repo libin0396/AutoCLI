@@ -32,6 +32,7 @@ class MockWebSocket {
 function createChromeMock() {
   let nextTabId = 10;
   let debuggerEventListener: ((source: { tabId?: number }, method: string, params?: any) => void) | null = null;
+  const tabUpdatedListeners: Array<(id: number, info: chrome.tabs.TabChangeInfo, tab: chrome.tabs.Tab) => void> = [];
   const tabs: MockTab[] = [
     { id: 1, windowId: 1, url: 'https://automation.example', title: 'automation', active: true, status: 'complete' },
     { id: 2, windowId: 2, url: 'https://user.example', title: 'user', active: true, status: 'complete' },
@@ -60,6 +61,17 @@ function createChromeMock() {
     if (updates.url !== undefined) tab.url = updates.url;
     return tab;
   });
+  const reload = vi.fn(async (tabId: number) => {
+    const tab = tabs.find((entry) => entry.id === tabId);
+    if (!tab) throw new Error(`Unknown tab ${tabId}`);
+    tab.status = 'loading';
+    setTimeout(() => {
+      tab.status = 'complete';
+      for (const listener of [...tabUpdatedListeners]) {
+        listener(tabId, { status: 'complete' }, tab as chrome.tabs.Tab);
+      }
+    }, 0);
+  });
 
   const debuggerApi = {
     attach: vi.fn(async () => {}),
@@ -81,6 +93,7 @@ function createChromeMock() {
       query,
       create,
       update,
+      reload,
       move: vi.fn(async (tabId: number, moveProperties: { windowId: number }) => {
         const tab = tabs.find((entry) => entry.id === tabId);
         if (!tab) throw new Error(`Unknown tab ${tabId}`);
@@ -94,7 +107,15 @@ function createChromeMock() {
         return tab;
       }),
       onRemoved: { addListener: vi.fn() } as Listener<(tabId: number) => void>,
-      onUpdated: { addListener: vi.fn(), removeListener: vi.fn() } as Listener<(id: number, info: chrome.tabs.TabChangeInfo) => void>,
+      onUpdated: {
+        addListener: vi.fn((fn: (id: number, info: chrome.tabs.TabChangeInfo, tab: chrome.tabs.Tab) => void) => {
+          tabUpdatedListeners.push(fn);
+        }),
+        removeListener: vi.fn((fn: (id: number, info: chrome.tabs.TabChangeInfo, tab: chrome.tabs.Tab) => void) => {
+          const index = tabUpdatedListeners.indexOf(fn);
+          if (index >= 0) tabUpdatedListeners.splice(index, 1);
+        }),
+      } as Listener<(id: number, info: chrome.tabs.TabChangeInfo, tab: chrome.tabs.Tab) => void>,
     },
     windows: {
       get: vi.fn(async (windowId: number) => ({ id: windowId })),
@@ -125,7 +146,7 @@ function createChromeMock() {
     },
   };
 
-  return { chrome, tabs, query, create, update, debuggerApi, getDebuggerEventListener: () => debuggerEventListener };
+  return { chrome, tabs, query, create, update, reload, debuggerApi, getDebuggerEventListener: () => debuggerEventListener };
 }
 
 describe('background tab isolation', () => {
@@ -276,6 +297,36 @@ describe('background tab isolation', () => {
       status: 200,
       response_body: '{"ok":true}',
     });
+  });
+
+  it('reloads an already-loaded target URL while passive network capture is active', async () => {
+    const { chrome, tabs, reload } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    mod.__test__.setAutomationWindowId('site:goofish', 1);
+    const targetUrl = 'https://www.goofish.com/search?q=AI%E6%99%BA%E8%83%BD%E4%BD%93%E5%AE%9A%E5%88%B6';
+    tabs[0].url = targetUrl;
+    tabs[0].status = 'complete';
+
+    const started = await mod.__test__.handleNetworkCapture({
+      id: '8',
+      action: 'network-capture',
+      op: 'start',
+      pattern: 'mtop.taobao.idlemtopsearch.pc.search',
+      workspace: 'site:goofish',
+    }, 'site:goofish');
+    expect(started.ok).toBe(true);
+
+    const result = await mod.__test__.handleNavigate({
+      id: '9',
+      action: 'navigate',
+      url: targetUrl,
+      workspace: 'site:goofish',
+    }, 'site:goofish');
+
+    expect(result.ok).toBe(true);
+    expect(reload).toHaveBeenCalledWith(1, { bypassCache: true });
   });
 
   it('reports sessions per workspace', async () => {
