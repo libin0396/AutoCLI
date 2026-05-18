@@ -27,6 +27,10 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// Idle shutdown threshold.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Increment when the daemon/CLI/extension command contract changes in a way
+/// that old same-version daemons must not be reused.
+const DAEMON_PROTOCOL_VERSION: u64 = 1;
+const DAEMON_CAPABILITIES: &[&str] = &["network-capture:start-pattern-ack"];
 
 type PendingMap = HashMap<String, oneshot::Sender<DaemonResult>>;
 
@@ -131,7 +135,12 @@ impl Daemon {
 
 /// GET /health — simple liveness check.
 async fn health_handler() -> impl IntoResponse {
-    Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
+    Json(json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "daemonProtocol": DAEMON_PROTOCOL_VERSION,
+        "capabilities": DAEMON_CAPABILITIES,
+    }))
 }
 
 /// POST /ai-generate — proxy AI request to autocli.ai with local token.
@@ -380,6 +389,9 @@ async fn status_handler(State(state): State<Arc<DaemonState>>) -> impl IntoRespo
     Json(json!({
         "daemon": true,
         "extension": ext,
+        "version": env!("CARGO_PKG_VERSION"),
+        "daemonProtocol": DAEMON_PROTOCOL_VERSION,
+        "capabilities": DAEMON_CAPABILITIES,
         // Original OpenCLI compatibility fields
         "ok": true,
         "extensionConnected": ext,

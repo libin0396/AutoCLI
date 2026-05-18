@@ -21,6 +21,8 @@ use crate::args::coerce_and_validate_args;
 use crate::commands::{completion, doctor, read};
 use crate::execution::execute_command;
 
+const REQUIRED_DAEMON_PROTOCOL: u64 = 1;
+
 fn build_cli(registry: &Registry, external_clis: &[ExternalCli]) -> Command {
     let mut app = Command::new("autocli")
         .version(env!("CARGO_PKG_VERSION"))
@@ -511,11 +513,23 @@ async fn main() {
                     // Daemon is running — check version
                     if let Ok(body) = resp.json::<serde_json::Value>().await {
                         let daemon_version = body.get("version").and_then(|v| v.as_str()).unwrap_or("");
-                        if daemon_version == current_version {
+                        let daemon_protocol = body
+                            .get("daemonProtocol")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        if daemon_version == current_version
+                            && daemon_protocol >= REQUIRED_DAEMON_PROTOCOL
+                        {
                             need_start = false;
-                            tracing::debug!(port, version = daemon_version, "Daemon already running with correct version");
+                            tracing::debug!(port, version = daemon_version, daemon_protocol, "Daemon already running with compatible protocol");
                         } else {
-                            tracing::info!(daemon_version, current_version, "Daemon version mismatch, restarting");
+                            tracing::info!(
+                                daemon_version,
+                                current_version,
+                                daemon_protocol,
+                                required_daemon_protocol = REQUIRED_DAEMON_PROTOCOL,
+                                "Daemon version/protocol mismatch, restarting"
+                            );
                             // Kill old daemon by requesting shutdown, or find and kill process on the port
                             kill_process_on_port(port);
                             // Wait briefly for port to free up

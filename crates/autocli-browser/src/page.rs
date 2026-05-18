@@ -267,6 +267,12 @@ impl IPage for DaemonPage {
             Err(err) if is_unsupported_network_capture_error(&err) => return Ok(()),
             Err(err) => return Err(err),
         };
+        let returned_pattern = val.get("pattern").and_then(|v| v.as_str());
+        if returned_pattern != Some(url_pattern) {
+            return Err(CliError::browser_connect(format!(
+                "Network capture did not start; daemon returned malformed start acknowledgement. Expected pattern {url_pattern:?}, got {returned_pattern:?}. Stop the old AutoCLI daemon on port 19925 and restart the packaged AutoCLI runtime."
+            )));
+        }
         if let Some(tab_id) = val.get("tabId").and_then(|v| v.as_u64()) {
             *self.tab_id.write().await = Some(tab_id);
         }
@@ -516,5 +522,21 @@ mod tests {
             .expect("old extensions should collect as empty");
 
         assert!(responses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn network_capture_start_rejects_old_daemon_collect_response() {
+        let (port, _received) = spawn_test_server(vec![json!([])]).await;
+
+        let page = DaemonPage::new(Arc::new(DaemonClient::new(port)), "site:goofish");
+        let err = page
+            .start_network_capture("mtop.taobao.idlemtopsearch.pc.search", Some(4096))
+            .await
+            .expect_err("old daemon collect response should not be accepted as start");
+
+        assert!(
+            err.to_string().contains("Network capture did not start"),
+            "unexpected error: {err}"
+        );
     }
 }
