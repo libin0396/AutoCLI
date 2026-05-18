@@ -229,6 +229,55 @@ describe('background tab isolation', () => {
     expect(JSON.stringify(collected.data)).not.toContain('Bearer secret');
   });
 
+  it('captures matching mtop responses even when Chrome classifies them as script resources', async () => {
+    const { chrome, getDebuggerEventListener } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    mod.__test__.setAutomationWindowId('site:goofish', 1);
+
+    const started = await mod.__test__.handleNetworkCapture({
+      id: '6',
+      action: 'network-capture',
+      op: 'start',
+      pattern: 'mtop.taobao.idlemtopsearch.pc.search',
+      workspace: 'site:goofish',
+    }, 'site:goofish');
+    expect(started.ok).toBe(true);
+
+    const listener = getDebuggerEventListener();
+    listener?.({ tabId: 1 }, 'Network.responseReceived', {
+      requestId: 'jsonp-1',
+      type: 'Script',
+      response: {
+        url: 'https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/?api=mtop.taobao.idlemtopsearch.pc.search&v=1.0&type=jsonp&dataType=jsonp',
+        status: 200,
+        headers: {
+          'content-type': 'application/javascript;charset=UTF-8',
+        },
+      },
+    });
+    listener?.({ tabId: 1 }, 'Network.loadingFinished', { requestId: 'jsonp-1' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const collected = await mod.__test__.handleNetworkCapture({
+      id: '7',
+      action: 'network-capture',
+      op: 'collect',
+      clear: true,
+      workspace: 'site:goofish',
+    }, 'site:goofish');
+
+    expect(collected.ok).toBe(true);
+    const responses = collected.data as Array<Record<string, unknown>>;
+    expect(responses).toHaveLength(1);
+    expect(responses[0]).toMatchObject({
+      url: 'https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/?api=mtop.taobao.idlemtopsearch.pc.search&v=1.0&type=jsonp&dataType=jsonp',
+      status: 200,
+      response_body: '{"ok":true}',
+    });
+  });
+
   it('reports sessions per workspace', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);

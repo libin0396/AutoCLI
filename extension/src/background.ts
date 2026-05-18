@@ -230,6 +230,12 @@ function hasActiveNetworkCapture(tabId: number): boolean {
   return networkCaptures.has(tabId);
 }
 
+function shouldCaptureNetworkResource(type?: string): boolean {
+  const normalized = String(type || '').toLowerCase();
+  if (!normalized) return true;
+  return ['xhr', 'fetch', 'script', 'other'].includes(normalized);
+}
+
 chrome.debugger.onEvent.addListener((source, method, paramsRaw) => {
   const tabId = source.tabId;
   if (!tabId) return;
@@ -249,8 +255,7 @@ chrome.debugger.onEvent.addListener((source, method, paramsRaw) => {
     const url = params.response?.url || '';
     const requestId = params.requestId || '';
     if (!requestId || !url || !matchesCapturePattern(state, url)) return;
-    const resourceType = String(params.type || '').toLowerCase();
-    if (resourceType && !['xhr', 'fetch'].includes(resourceType)) return;
+    if (!shouldCaptureNetworkResource(params.type)) return;
     state.pending.set(requestId, {
       url: sanitizeObservedUrl(url),
       method: 'GET',
