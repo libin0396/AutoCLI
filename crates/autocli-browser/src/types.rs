@@ -16,6 +16,14 @@ pub struct DaemonCommand {
     pub tab_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_limit: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clear: Option<bool>,
 }
 
 impl DaemonCommand {
@@ -28,6 +36,10 @@ impl DaemonCommand {
             workspace: None,
             tab_id: None,
             format: None,
+            op: None,
+            pattern: None,
+            body_limit: None,
+            clear: None,
         }
     }
 
@@ -53,6 +65,26 @@ impl DaemonCommand {
 
     pub fn with_format(mut self, format: impl Into<String>) -> Self {
         self.format = Some(format.into());
+        self
+    }
+
+    pub fn with_op(mut self, op: impl Into<String>) -> Self {
+        self.op = Some(op.into());
+        self
+    }
+
+    pub fn with_pattern(mut self, pattern: impl Into<String>) -> Self {
+        self.pattern = Some(pattern.into());
+        self
+    }
+
+    pub fn with_body_limit(mut self, body_limit: usize) -> Self {
+        self.body_limit = Some(body_limit);
+        self
+    }
+
+    pub fn with_clear(mut self, clear: bool) -> Self {
+        self.clear = Some(clear);
         self
     }
 }
@@ -146,5 +178,24 @@ mod tests {
             })
         );
         assert!(value.get("tab_id").is_none(), "tab_id should not be serialized");
+    }
+
+    #[test]
+    fn daemon_command_serializes_network_capture_fields_as_camel_case() {
+        let value = serde_json::to_value(
+            DaemonCommand::new("network-capture")
+                .with_workspace("site:goofish")
+                .with_op("start")
+                .with_pattern("mtop.taobao.idlemtopsearch.pc.search")
+                .with_body_limit(4096),
+        )
+        .expect("command should serialize");
+
+        assert_eq!(value.get("bodyLimit").and_then(|v| v.as_u64()), Some(4096));
+        assert_eq!(
+            value.get("pattern").and_then(|v| v.as_str()),
+            Some("mtop.taobao.idlemtopsearch.pc.search")
+        );
+        assert!(value.get("body_limit").is_none(), "body_limit should not be serialized");
     }
 }

@@ -31,6 +31,7 @@ class MockWebSocket {
 
 function createChromeMock() {
   let nextTabId = 10;
+  let debuggerEventListener: ((source: { tabId?: number }, method: string, params?: any) => void) | null = null;
   const tabs: MockTab[] = [
     { id: 1, windowId: 1, url: 'https://automation.example', title: 'automation', active: true, status: 'complete' },
     { id: 2, windowId: 2, url: 'https://user.example', title: 'user', active: true, status: 'complete' },
@@ -60,17 +61,39 @@ function createChromeMock() {
     return tab;
   });
 
+  const debuggerApi = {
+    attach: vi.fn(async () => {}),
+    detach: vi.fn(async () => {}),
+    sendCommand: vi.fn(async (_target: unknown, method: string) => {
+      if (method === 'Network.getResponseBody') return { body: '{"ok":true}', base64Encoded: false };
+      return {};
+    }),
+    onEvent: {
+      addListener: vi.fn((fn: (source: { tabId?: number }, method: string, params?: any) => void) => {
+        debuggerEventListener = fn;
+      }),
+    },
+    onDetach: { addListener: vi.fn() } as Listener<() => void>,
+  };
+
   const chrome = {
     tabs: {
       query,
       create,
       update,
+      move: vi.fn(async (tabId: number, moveProperties: { windowId: number }) => {
+        const tab = tabs.find((entry) => entry.id === tabId);
+        if (!tab) throw new Error(`Unknown tab ${tabId}`);
+        tab.windowId = moveProperties.windowId;
+        return [tab];
+      }),
       remove: vi.fn(async (_tabId: number) => {}),
       get: vi.fn(async (tabId: number) => {
         const tab = tabs.find((entry) => entry.id === tabId);
         if (!tab) throw new Error(`Unknown tab ${tabId}`);
         return tab;
       }),
+      onRemoved: { addListener: vi.fn() } as Listener<(tabId: number) => void>,
       onUpdated: { addListener: vi.fn(), removeListener: vi.fn() } as Listener<(id: number, info: chrome.tabs.TabChangeInfo) => void>,
     },
     windows: {
@@ -84,21 +107,32 @@ function createChromeMock() {
       onAlarm: { addListener: vi.fn() } as Listener<(alarm: { name: string }) => void>,
     },
     runtime: {
+      getManifest: vi.fn(() => ({ version: 'test' })),
       onInstalled: { addListener: vi.fn() } as Listener<() => void>,
       onStartup: { addListener: vi.fn() } as Listener<() => void>,
+      onMessage: { addListener: vi.fn() } as Listener<(msg: unknown, sender: unknown, sendResponse: (response?: unknown) => void) => boolean | void>,
+      onConnect: { addListener: vi.fn() } as Listener<(port: unknown) => void>,
     },
     cookies: {
       getAll: vi.fn(async () => []),
     },
+    debugger: debuggerApi,
+    scripting: {
+      executeScript: vi.fn(async () => [{ result: false }]),
+    },
+    action: {
+      onClicked: { addListener: vi.fn() } as Listener<(tab: { id?: number }) => void>,
+    },
   };
 
-  return { chrome, tabs, query, create, update };
+  return { chrome, tabs, query, create, update, debuggerApi, getDebuggerEventListener: () => debuggerEventListener };
 }
 
 describe('background tab isolation', () => {
   beforeEach(() => {
     vi.resetModules();
     vi.stubGlobal('WebSocket', MockWebSocket);
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false })));
   });
 
   it('lists only automation-window web tabs', async () => {
@@ -133,6 +167,66 @@ describe('background tab isolation', () => {
 
     expect(result.ok).toBe(true);
     expect(create).toHaveBeenCalledWith({ windowId: 1, url: 'https://new.example', active: true });
+  });
+
+  it('captures passive network response bodies and removes sensitive metadata', async () => {
+    const { chrome, debuggerApi, getDebuggerEventListener } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+
+    const mod = await import('./background');
+    mod.__test__.setAutomationWindowId('site:goofish', 1);
+
+    const started = await mod.__test__.handleNetworkCapture({
+      id: '4',
+      action: 'network-capture',
+      op: 'start',
+      pattern: 'mtop.taobao.idlemtopsearch.pc.search',
+      bodyLimit: 200,
+      workspace: 'site:goofish',
+    }, 'site:goofish');
+    expect(started.ok).toBe(true);
+    expect(debuggerApi.sendCommand).toHaveBeenCalledWith({ tabId: 1 }, 'Network.enable', {});
+
+    const listener = getDebuggerEventListener();
+    expect(listener).toBeTruthy();
+    listener?.({ tabId: 1 }, 'Network.responseReceived', {
+      requestId: 'req-1',
+      type: 'Fetch',
+      response: {
+        url: 'https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/?jsv=2&api=mtop.taobao.idlemtopsearch.pc.search&v=1.0&type=json&dataType=json&data=%7B%22secret%22%3Atrue%7D&_m_h5_tk=token',
+        status: 200,
+        headers: {
+          'content-type': 'application/json;charset=UTF-8',
+          'set-cookie': 'secret=1',
+          authorization: 'Bearer secret',
+          'x-extra-debug': 'drop-me',
+        },
+      },
+    });
+    listener?.({ tabId: 1 }, 'Network.loadingFinished', { requestId: 'req-1' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const collected = await mod.__test__.handleNetworkCapture({
+      id: '5',
+      action: 'network-capture',
+      op: 'collect',
+      clear: true,
+      workspace: 'site:goofish',
+    }, 'site:goofish');
+
+    expect(collected.ok).toBe(true);
+    expect(collected.data).toEqual([
+      {
+        url: 'https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/?api=mtop.taobao.idlemtopsearch.pc.search&v=1.0&type=json&dataType=json',
+        method: 'GET',
+        headers: { 'content-type': 'application/json;charset=UTF-8' },
+        status: 200,
+        response_body: '{"ok":true}',
+      },
+    ]);
+    expect(JSON.stringify(collected.data)).not.toContain('_m_h5_tk');
+    expect(JSON.stringify(collected.data)).not.toContain('secret=1');
+    expect(JSON.stringify(collected.data)).not.toContain('Bearer secret');
   });
 
   it('reports sessions per workspace', async () => {

@@ -11,6 +11,12 @@ import type { Command, Result } from './protocol';
 import { DAEMON_WS_URL, DAEMON_PING_URL, WS_RECONNECT_BASE_DELAY, WS_RECONNECT_MAX_DELAY } from './protocol';
 import * as executor from './cdp';
 
+declare global {
+  interface Window {
+    __autocliSelectorActive?: boolean;
+  }
+}
+
 let ws: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectAttempts = 0;
@@ -146,6 +152,138 @@ type AutomationSession = {
 
 const automationSessions = new Map<string, AutomationSession>();
 const WINDOW_IDLE_TIMEOUT = 30000; // 30s — quick cleanup after command finishes
+
+type CapturedNetworkResponse = {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  status?: number;
+  response_body?: string;
+};
+
+type PendingNetworkResponse = {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  status?: number;
+};
+
+type NetworkCaptureState = {
+  pattern: string;
+  regex: RegExp | null;
+  bodyLimit: number;
+  pending: Map<string, PendingNetworkResponse>;
+  responses: CapturedNetworkResponse[];
+};
+
+const networkCaptures = new Map<number, NetworkCaptureState>();
+const DEFAULT_NETWORK_BODY_LIMIT = 2_000_000;
+
+function compileCapturePattern(pattern: string): RegExp | null {
+  try {
+    return new RegExp(pattern);
+  } catch {
+    return null;
+  }
+}
+
+function matchesCapturePattern(state: NetworkCaptureState, url: string): boolean {
+  if (state.regex) return state.regex.test(url);
+  return url.includes(state.pattern);
+}
+
+function responseHeadersToMap(headers?: Record<string, unknown> | Array<{ name?: string; value?: string }>): Record<string, string> {
+  const out: Record<string, string> = {};
+  const entries = Array.isArray(headers)
+    ? headers.map((header) => [header.name, header.value])
+    : Object.entries(headers || {});
+  for (const [rawName, rawValue] of entries) {
+    const name = String(rawName || '').toLowerCase();
+    if (!name || name === 'set-cookie' || name === 'cookie' || name === 'authorization') continue;
+    if (name === 'content-type' || name === 'content-length') {
+      out[name] = String(rawValue || '');
+    }
+  }
+  return out;
+}
+
+function sanitizeObservedUrl(rawUrl: string): string {
+  try {
+    const url = new URL(rawUrl);
+    const safe = new URL(`${url.origin}${url.pathname}`);
+    for (const key of ['api', 'v', 'type', 'dataType']) {
+      const value = url.searchParams.get(key);
+      if (value) safe.searchParams.set(key, value);
+    }
+    return safe.toString();
+  } catch {
+    return rawUrl.split('?')[0] || rawUrl;
+  }
+}
+
+function truncateBody(body: string, limit: number): string {
+  if (limit <= 0 || body.length <= limit) return body;
+  return body.slice(0, limit);
+}
+
+function hasActiveNetworkCapture(tabId: number): boolean {
+  return networkCaptures.has(tabId);
+}
+
+chrome.debugger.onEvent.addListener((source, method, paramsRaw) => {
+  const tabId = source.tabId;
+  if (!tabId) return;
+  const state = networkCaptures.get(tabId);
+  if (!state) return;
+  const params = (paramsRaw || {}) as {
+    requestId?: string;
+    type?: string;
+    response?: {
+      url?: string;
+      status?: number;
+      headers?: Record<string, unknown> | Array<{ name?: string; value?: string }>;
+      requestHeaders?: Record<string, unknown> | Array<{ name?: string; value?: string }>;
+    };
+  };
+  if (method === 'Network.responseReceived') {
+    const url = params.response?.url || '';
+    const requestId = params.requestId || '';
+    if (!requestId || !url || !matchesCapturePattern(state, url)) return;
+    const resourceType = String(params.type || '').toLowerCase();
+    if (resourceType && !['xhr', 'fetch'].includes(resourceType)) return;
+    state.pending.set(requestId, {
+      url: sanitizeObservedUrl(url),
+      method: 'GET',
+      headers: responseHeadersToMap(params.response?.headers),
+      status: params.response?.status,
+    });
+    return;
+  }
+  if (method !== 'Network.loadingFinished') return;
+  const requestId = params.requestId || '';
+  const pending = state.pending.get(requestId);
+  if (!requestId || !pending) return;
+  state.pending.delete(requestId);
+  void (async () => {
+    try {
+      const bodyResult = await chrome.debugger.sendCommand({ tabId }, 'Network.getResponseBody', { requestId }) as {
+        body?: string;
+        base64Encoded?: boolean;
+      };
+      const body = bodyResult.base64Encoded ? atob(bodyResult.body || '') : (bodyResult.body || '');
+      state.responses.push({
+        ...pending,
+        response_body: truncateBody(body, state.bodyLimit),
+      });
+    } catch (err) {
+      state.responses.push({
+        ...pending,
+        response_body: '',
+      });
+      console.warn(`[autocli] failed to read observed response body: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  })();
+});
 
 function getWorkspaceKey(workspace?: string): string {
   return workspace?.trim() || 'default';
@@ -305,6 +443,8 @@ async function handleCommand(cmd: Command): Promise<Result> {
         return await handleCloseWindow(cmd, workspace);
       case 'cdp':
         return await handleCdp(cmd, workspace);
+      case 'network-capture':
+        return await handleNetworkCapture(cmd, workspace);
       case 'sessions':
         return await handleSessions(cmd);
       case 'set-file-input':
@@ -487,13 +627,15 @@ async function handleNavigate(cmd: Command, workspace: string): Promise<Result> 
     };
   }
 
-  // Detach any existing debugger before top-level navigation.
-  // Some sites (observed on creator.xiaohongshu.com flows) can invalidate the
-  // current inspected target during navigation, which leaves a stale CDP attach
-  // state and causes the next Runtime.evaluate to fail with
-  // "Inspected target navigated or closed". Resetting here forces a clean
-  // re-attach after navigation.
-  await executor.detach(tabId);
+  // Detach any existing debugger before top-level navigation unless a passive
+  // network capture is active. Captures must stay attached across navigation so
+  // CDP Network.responseReceived can observe the browser's own requests.
+  if (!hasActiveNetworkCapture(tabId)) {
+    await executor.detach(tabId);
+  } else {
+    await executor.ensureAttached(tabId);
+    await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {});
+  }
 
   await chrome.tabs.update(tabId, { url: targetUrl });
 
@@ -710,6 +852,44 @@ async function handleCdp(cmd: Command, workspace: string): Promise<Result> {
   }
 }
 
+async function handleNetworkCapture(cmd: Command, workspace: string): Promise<Result> {
+  const op = cmd.op || 'collect';
+  const tabId = await resolveTabId(cmd.tabId, workspace);
+  if (op === 'start') {
+    const pattern = String(cmd.pattern || '').trim();
+    if (!pattern) return { id: cmd.id, ok: false, error: 'Missing network capture pattern' };
+    try {
+      await executor.ensureAttached(tabId);
+      await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {});
+      networkCaptures.set(tabId, {
+        pattern,
+        regex: compileCapturePattern(pattern),
+        bodyLimit: Math.max(1024, Math.min(Number(cmd.bodyLimit || DEFAULT_NETWORK_BODY_LIMIT), 10_000_000)),
+        pending: new Map(),
+        responses: [],
+      });
+      return { id: cmd.id, ok: true, data: { tabId, pattern } };
+    } catch (err) {
+      return { id: cmd.id, ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+  if (op === 'collect') {
+    const state = networkCaptures.get(tabId);
+    const responses = state ? [...state.responses] : [];
+    if (state && cmd.clear !== false) {
+      networkCaptures.delete(tabId);
+      try { await chrome.debugger.sendCommand({ tabId }, 'Network.disable', {}); } catch { /* ignore */ }
+    }
+    return { id: cmd.id, ok: true, data: responses };
+  }
+  if (op === 'stop') {
+    networkCaptures.delete(tabId);
+    try { await chrome.debugger.sendCommand({ tabId }, 'Network.disable', {}); } catch { /* ignore */ }
+    return { id: cmd.id, ok: true, data: { stopped: true } };
+  }
+  return { id: cmd.id, ok: false, error: `Unknown network-capture op: ${op}` };
+}
+
 async function handleCloseWindow(cmd: Command, workspace: string): Promise<Result> {
   const session = automationSessions.get(workspace);
   if (session) {
@@ -837,6 +1017,7 @@ async function handleSessions(cmd: Command): Promise<Result> {
 
 export const __test__ = {
   handleNavigate,
+  handleNetworkCapture,
   isTargetUrl,
   handleTabs,
   handleSessions,

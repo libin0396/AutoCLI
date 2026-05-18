@@ -609,6 +609,118 @@ impl StepHandler for CollectStep {
 }
 
 // ---------------------------------------------------------------------------
+// ObserveNetworkStep — passive CDP Network.responseReceived capture
+// ---------------------------------------------------------------------------
+
+pub struct ObserveNetworkStep;
+
+#[async_trait]
+impl StepHandler for ObserveNetworkStep {
+    fn name(&self) -> &'static str {
+        "observe_network"
+    }
+
+    fn is_browser_step(&self) -> bool {
+        true
+    }
+
+    async fn execute(
+        &self,
+        page: Option<Arc<dyn IPage>>,
+        params: &Value,
+        data: &Value,
+        args: &HashMap<String, Value>,
+    ) -> Result<Value, CliError> {
+        let pg = require_page(&page)?;
+        let ctx = default_ctx(data, args);
+        let (pattern, body_limit) = match params {
+            Value::String(s) => {
+                let rendered = render_template_str(s, &ctx)?;
+                let pattern = rendered
+                    .as_str()
+                    .ok_or_else(|| CliError::pipeline("observe_network: pattern must resolve to a string"))?
+                    .to_string();
+                (pattern, None)
+            }
+            Value::Object(obj) => {
+                let raw = obj
+                    .get("pattern")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| CliError::pipeline("observe_network: missing 'pattern' field"))?;
+                let rendered = render_template_str(raw, &ctx)?;
+                let pattern = rendered
+                    .as_str()
+                    .ok_or_else(|| CliError::pipeline("observe_network: pattern must resolve to a string"))?
+                    .to_string();
+                let body_limit = obj
+                    .get("bodyLimit")
+                    .or_else(|| obj.get("body_limit"))
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize);
+                (pattern, body_limit)
+            }
+            _ => {
+                return Err(CliError::pipeline(
+                    "observe_network: params must be a string pattern or object with 'pattern'",
+                ))
+            }
+        };
+        pg.start_network_capture(&pattern, body_limit).await?;
+        Ok(data.clone())
+    }
+}
+
+pub struct CollectNetworkStep;
+
+#[async_trait]
+impl StepHandler for CollectNetworkStep {
+    fn name(&self) -> &'static str {
+        "collect_network"
+    }
+
+    fn is_browser_step(&self) -> bool {
+        true
+    }
+
+    async fn execute(
+        &self,
+        page: Option<Arc<dyn IPage>>,
+        params: &Value,
+        _data: &Value,
+        _args: &HashMap<String, Value>,
+    ) -> Result<Value, CliError> {
+        let pg = require_page(&page)?;
+        let (wait_ms, clear) = match params {
+            Value::Object(obj) => {
+                let wait = obj
+                    .get("wait")
+                    .and_then(|v| v.as_f64())
+                    .map(|s| (s * 1000.0) as u64)
+                    .unwrap_or(0);
+                let clear = obj.get("clear").and_then(|v| v.as_bool()).unwrap_or(true);
+                (wait, clear)
+            }
+            Value::Number(num) => (num.as_f64().map(|s| (s * 1000.0) as u64).unwrap_or(0), true),
+            Value::Null => (0, true),
+            _ => {
+                return Err(CliError::pipeline(
+                    "collect_network: params must be null, seconds, or object",
+                ))
+            }
+        };
+        if wait_ms > 0 {
+            pg.wait_for_timeout(wait_ms).await?;
+        }
+        let responses = pg.get_network_responses(clear).await?;
+        let result: Vec<Value> = responses
+            .into_iter()
+            .map(|r| serde_json::to_value(&r).unwrap_or(Value::Null))
+            .collect();
+        Ok(Value::Array(result))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
@@ -623,6 +735,8 @@ pub fn register_browser_steps(registry: &mut StepRegistry) {
     registry.register(Arc::new(ScreenshotStep));
     registry.register(Arc::new(ScrollStep));
     registry.register(Arc::new(CollectStep));
+    registry.register(Arc::new(ObserveNetworkStep));
+    registry.register(Arc::new(CollectNetworkStep));
 }
 
 // ---------------------------------------------------------------------------
@@ -747,6 +861,19 @@ mod tests {
         ) -> Result<Vec<autocli_core::NetworkRequest>, CliError> {
             Ok(vec![])
         }
+        async fn start_network_capture(
+            &self,
+            _url_pattern: &str,
+            _body_limit: Option<usize>,
+        ) -> Result<(), CliError> {
+            Ok(())
+        }
+        async fn get_network_responses(
+            &self,
+            _clear: bool,
+        ) -> Result<Vec<autocli_core::NetworkRequest>, CliError> {
+            Ok(vec![])
+        }
     }
 
     #[tokio::test]
@@ -761,6 +888,8 @@ mod tests {
         assert!(registry.get("evaluate").is_some());
         assert!(registry.get("snapshot").is_some());
         assert!(registry.get("screenshot").is_some());
+        assert!(registry.get("observe_network").is_some());
+        assert!(registry.get("collect_network").is_some());
     }
 
     #[tokio::test]
@@ -818,6 +947,8 @@ mod tests {
         assert!(EvaluateStep.is_browser_step());
         assert!(SnapshotStep.is_browser_step());
         assert!(ScreenshotStep.is_browser_step());
+        assert!(ObserveNetworkStep.is_browser_step());
+        assert!(CollectNetworkStep.is_browser_step());
     }
 
     #[tokio::test]

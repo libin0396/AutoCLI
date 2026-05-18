@@ -58,7 +58,7 @@ describe('cdp attach recovery', () => {
     expect(scripting.executeScript).not.toHaveBeenCalled();
   });
 
-  it('retries after cleanup when attach fails with a foreign extension error', async () => {
+  it('retries attach failures without mutating the DOM', async () => {
     const { chrome, debuggerApi, scripting } = createChromeMock();
     debuggerApi.attach
       .mockRejectedValueOnce(new Error('Cannot access a chrome-extension:// URL of different extension'))
@@ -69,7 +69,7 @@ describe('cdp attach recovery', () => {
     const result = await mod.evaluate(1, '1');
 
     expect(result).toBe('ok');
-    expect(scripting.executeScript).toHaveBeenCalledTimes(1);
+    expect(scripting.executeScript).not.toHaveBeenCalled();
     expect(debuggerApi.attach).toHaveBeenCalledTimes(2);
   });
 });

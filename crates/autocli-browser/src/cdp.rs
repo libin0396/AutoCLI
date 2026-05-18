@@ -327,4 +327,23 @@ impl IPage for CdpPage {
         let reqs: Vec<NetworkRequest> = serde_json::from_value(val).unwrap_or_default();
         Ok(reqs)
     }
+
+    async fn start_network_capture(
+        &self,
+        _url_pattern: &str,
+        _body_limit: Option<usize>,
+    ) -> Result<(), CliError> {
+        Err(CliError::command_execution(
+            "passive network capture is only supported by the Chrome extension bridge",
+        ))
+    }
+
+    async fn get_network_responses(
+        &self,
+        _clear: bool,
+    ) -> Result<Vec<NetworkRequest>, CliError> {
+        Err(CliError::command_execution(
+            "passive network capture is only supported by the Chrome extension bridge",
+        ))
+    }
 }

@@ -3,11 +3,11 @@
 /**
  * autocli browser protocol — shared types between daemon, extension, and CLI.
  *
- * 5 actions: exec, navigate, tabs, cookies, screenshot.
- * Everything else is just JS code sent via 'exec'.
+ * Commands are small browser operations sent from the daemon to the extension.
+ * Most page-specific logic still travels as JS through the 'exec' action.
  */
 
-export type Action = 'exec' | 'navigate' | 'tabs' | 'cookies' | 'screenshot' | 'close-window' | 'sessions' | 'set-file-input' | 'cdp' | 'read-article';
+export type Action = 'exec' | 'navigate' | 'tabs' | 'cookies' | 'screenshot' | 'close-window' | 'sessions' | 'set-file-input' | 'cdp' | 'read-article' | 'network-capture';
 
 export interface Command {
   /** Unique request ID */
@@ -23,7 +23,7 @@ export interface Command {
   /** URL to navigate to (navigate action) */
   url?: string;
   /** Sub-operation for tabs: list, new, close, select */
-  op?: 'list' | 'new' | 'close' | 'select';
+  op?: 'list' | 'new' | 'close' | 'select' | 'start' | 'collect' | 'stop';
   /** Tab index for tabs select/close */
   index?: number;
   /** Cookie domain filter */
@@ -42,6 +42,12 @@ export interface Command {
   cdpMethod?: string;
   /** CDP method params for 'cdp' action */
   cdpParams?: Record<string, unknown>;
+  /** URL regex/substring pattern for passive network capture */
+  pattern?: string;
+  /** Max response body characters retained for passive network capture */
+  bodyLimit?: number;
+  /** Whether collect operations should clear buffered network responses */
+  clear?: boolean;
 }
 
 export interface Result {

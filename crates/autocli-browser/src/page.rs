@@ -243,6 +243,40 @@ impl IPage for DaemonPage {
         let reqs: Vec<NetworkRequest> = serde_json::from_value(val).unwrap_or_default();
         Ok(reqs)
     }
+
+    async fn start_network_capture(
+        &self,
+        url_pattern: &str,
+        body_limit: Option<usize>,
+    ) -> Result<(), CliError> {
+        let mut cmd = self
+            .cmd("network-capture")
+            .await
+            .with_op("start")
+            .with_pattern(url_pattern);
+        if let Some(limit) = body_limit {
+            cmd = cmd.with_body_limit(limit);
+        }
+        let val = self.send(cmd).await?;
+        if let Some(tab_id) = val.get("tabId").and_then(|v| v.as_u64()) {
+            *self.tab_id.write().await = Some(tab_id);
+        }
+        Ok(())
+    }
+
+    async fn get_network_responses(
+        &self,
+        clear: bool,
+    ) -> Result<Vec<NetworkRequest>, CliError> {
+        let cmd = self
+            .cmd("network-capture")
+            .await
+            .with_op("collect")
+            .with_clear(clear);
+        let val = self.send(cmd).await?;
+        let reqs: Vec<NetworkRequest> = serde_json::from_value(val).unwrap_or_default();
+        Ok(reqs)
+    }
 }
 
 /// Simple base64 decoder (avoiding an extra dependency). Public for reuse by cdp module.
@@ -402,5 +436,44 @@ mod tests {
             err.to_string().contains("Navigate returned no tabId"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn network_capture_persists_returned_tab_id_for_collect() {
+        let (port, received) = spawn_test_server(vec![
+            json!({ "tabId": 77, "pattern": "mtop.taobao.idlemtopsearch.pc.search" }),
+            json!([{
+                "url": "https://h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search/1.0/?api=mtop.taobao.idlemtopsearch.pc.search",
+                "method": "GET",
+                "headers": { "content-type": "application/json" },
+                "status": 200,
+                "response_body": "{\"ok\":true}"
+            }]),
+        ])
+        .await;
+
+        let page = DaemonPage::new(Arc::new(DaemonClient::new(port)), "site:goofish");
+        page.start_network_capture("mtop.taobao.idlemtopsearch.pc.search", Some(4096))
+            .await
+            .expect("start network capture should succeed");
+        let responses = page
+            .get_network_responses(false)
+            .await
+            .expect("collect network responses should succeed");
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].status, Some(200));
+        assert_eq!(responses[0].response_body.as_deref(), Some("{\"ok\":true}"));
+
+        let commands = received.lock().expect("received lock poisoned");
+        assert_eq!(commands.len(), 2, "start + collect should be sent");
+        assert_eq!(commands[0].get("action").and_then(|v| v.as_str()), Some("network-capture"));
+        assert_eq!(commands[0].get("op").and_then(|v| v.as_str()), Some("start"));
+        assert_eq!(commands[0].get("bodyLimit").and_then(|v| v.as_u64()), Some(4096));
+        assert!(commands[0].get("body_limit").is_none(), "bodyLimit must be camelCase");
+        assert_eq!(commands[1].get("action").and_then(|v| v.as_str()), Some("network-capture"));
+        assert_eq!(commands[1].get("op").and_then(|v| v.as_str()), Some("collect"));
+        assert_eq!(commands[1].get("tabId").and_then(|v| v.as_u64()), Some(77));
+        assert_eq!(commands[1].get("clear").and_then(|v| v.as_bool()), Some(false));
     }
 }

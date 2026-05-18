@@ -193,4 +193,17 @@ pub trait IPage: Send + Sync {
 
     /// Get network requests (captured)
     async fn get_network_requests(&self) -> Result<Vec<NetworkRequest>, CliError>;
+
+    /// Start passively observing browser network responses that match a URL pattern.
+    async fn start_network_capture(
+        &self,
+        url_pattern: &str,
+        body_limit: Option<usize>,
+    ) -> Result<(), CliError>;
+
+    /// Collect passively observed browser network responses.
+    async fn get_network_responses(
+        &self,
+        clear: bool,
+    ) -> Result<Vec<NetworkRequest>, CliError>;
 }
